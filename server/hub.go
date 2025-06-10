@@ -6,41 +6,55 @@ import (
 	"sync"
 	"time"
 
+	"database/sql"
+
 	"gowhisper/internal/common"
+	"gowhisper/internal/db"
 
 	"github.com/gorilla/websocket"
 )
 
-// Client represents a connected user.
 type Client struct {
 	username string
 	conn     *websocket.Conn
 	hub      *Hub
-	send     chan []byte // Buffered channel of outbound messages
+	send     chan []byte
+	isAuthed bool
 }
 
-// Hub maintains the set of active clients and broadcasts messages.
 type Hub struct {
-	clients    map[*Client]bool     // Connected clients
-	register   chan *Client         // Register requests from clients
-	unregister chan *Client         // Unregister requests from clients
-	broadcast  chan []byte          // Inbound messages from the clients (to be broadcast or routed)
-	directMsg  chan *common.Message // Inbound direct messages
+	clients     map[*Client]bool
+	register    chan *Client
+	unregister  chan *Client
+	incomingMsg chan clientMessage // For processing messages from clients
 
-	// For mapping usernames to clients for DMs
-	userClients map[string]*Client
-	mu          sync.Mutex // Protects userClients
+	userClients map[string]*Client // username -> client mapping for online users
+	mu          sync.RWMutex       // Protects userClients and clients map
+}
+
+type clientMessage struct {
+	client *Client
+	data   []byte
 }
 
 func NewHub() *Hub {
 	return &Hub{
-		broadcast:   make(chan []byte),
-		directMsg:   make(chan *common.Message),
+		incomingMsg: make(chan clientMessage),
 		register:    make(chan *Client),
 		unregister:  make(chan *Client),
 		clients:     make(map[*Client]bool),
 		userClients: make(map[string]*Client),
 	}
+}
+
+func (h *Hub) getOnlineUsernames() []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	usernames := make([]string, 0, len(h.userClients))
+	for username := range h.userClients {
+		usernames = append(usernames, username)
+	}
+	return usernames
 }
 
 func (h *Hub) Run() {
@@ -49,131 +63,252 @@ func (h *Hub) Run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
-			if client.username != "" {
-				h.userClients[client.username] = client
-				log.Printf("User %s registered", client.username)
-			}
 			h.mu.Unlock()
+			log.Printf("Client connected, awaiting authentication.")
 
 		case client := <-h.unregister:
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
-				if client.username != "" {
+				if client.username != "" && client.isAuthed {
 					delete(h.userClients, client.username)
-					log.Printf("User %s unregistered", client.username)
+					log.Printf("User %s unregistered and disconnected.", client.username)
+					// TODO: Broadcast user offline status
+				} else {
+					log.Printf("Unauthenticated client disconnected.")
 				}
 				close(client.send)
 			}
 			h.mu.Unlock()
 
-		case msg := <-h.directMsg:
-			h.mu.Lock()
-			recipientClient, ok := h.userClients[msg.Recipient]
-			h.mu.Unlock()
-
-			if ok {
-				msgBytes, err := json.Marshal(msg)
-				if err != nil {
-					log.Printf("Error marshalling direct message: %v", err)
-					continue
-				}
-				select {
-				case recipientClient.send <- msgBytes:
-				default: // If recipient's send channel is full
-					log.Printf("Recipient %s's send channel full, closing connection.", recipientClient.username)
-					close(recipientClient.send)
-					delete(h.clients, recipientClient)
-					h.mu.Lock()
-					delete(h.userClients, recipientClient.username)
-					h.mu.Unlock()
-				}
-			} else {
-				log.Printf("Recipient %s not found for DM", msg.Recipient)
-				// TODO: Send an error back to the sender
-			}
-		// Example broadcast (not used much with DMs, but good to have)
-		case message := <-h.broadcast:
-			h.mu.Lock()
-			for client := range h.clients {
-				select {
-				case client.send <- message:
-				default:
-					close(client.send)
-					delete(h.clients, client)
-					if client.username != "" {
-						delete(h.userClients, client.username)
-					}
-				}
-			}
-			h.mu.Unlock()
+		case cm := <-h.incomingMsg:
+			h.handleClientMessage(cm.client, cm.data)
 		}
 	}
 }
 
-// readPump pumps messages from the WebSocket connection to the hub.
+func (h *Hub) handleClientMessage(client *Client, data []byte) {
+	var genericMsg common.GenericMessage
+	if err := json.Unmarshal(data, &genericMsg); err != nil {
+		log.Printf("Error unmarshalling generic message: %v", err)
+		client.sendError("Invalid message format")
+		return
+	}
+
+	// Authenticated routes
+	if client.isAuthed {
+		switch genericMsg.Type {
+		case common.MsgTypeEncryptedDM:
+			var edm common.EncryptedDirectMessage
+			if err := json.Unmarshal(data, &edm); err != nil {
+				client.sendError("Invalid encrypted DM format")
+				return
+			}
+			edm.Sender = client.username // Ensure sender is correct
+			h.routeEncryptedDM(&edm)
+		case common.MsgTypeRequestPubKey:
+			var reqPKey common.RequestPubKeyMessage
+			if err := json.Unmarshal(data, &reqPKey); err != nil {
+				client.sendError("Invalid public key request format")
+				return
+			}
+			h.handleRequestPubKey(client, reqPKey.TargetUser)
+		case common.MsgTypeRequestUserList:
+			onlineUsers := h.getOnlineUsernames()
+			resp := common.UserListResponseMessage{
+				BaseMessage: common.BaseMessage{Type: common.MsgTypeUserListResponse, Timestamp: time.Now()},
+				Usernames:   onlineUsers,
+			}
+			respBytes, _ := json.Marshal(resp)
+			client.send <- respBytes
+
+		default:
+			log.Printf("Received unhandled message type %s from authenticated user %s", genericMsg.Type, client.username)
+			client.sendError("Unknown command after authentication.")
+		}
+		return
+	}
+
+	// Unauthenticated routes (login/register)
+	switch genericMsg.Type {
+	case common.MsgTypeRegisterUser:
+		var regMsg common.ClientAuthMessage
+		if err := json.Unmarshal(data, &regMsg); err != nil {
+			client.sendError("Invalid registration message format")
+			return
+		}
+		h.handleUserRegistration(client, &regMsg)
+	case common.MsgTypeLoginUser:
+		var loginMsg common.ClientAuthMessage
+		if err := json.Unmarshal(data, &loginMsg); err != nil {
+			client.sendError("Invalid login message format")
+			return
+		}
+		h.handleUserLogin(client, &loginMsg)
+	default:
+		log.Printf("Received message type %s from unauthenticated client.", genericMsg.Type)
+		client.sendError("Authentication required.")
+		// Consider closing connection after a few bad attempts
+	}
+}
+
+func (h *Hub) handleUserRegistration(client *Client, msg *common.ClientAuthMessage) {
+	if msg.Username == "" || msg.Password == "" || len(msg.ECDHPublicKey) == 0 {
+		client.sendAuthResponse(common.MsgTypeRegistrationFailed, msg.Username, nil, "Username, password, and public key are required.")
+		return
+	}
+	// Check if user already exists
+	// db.GetUserPublicKey now returns (nil, sql.ErrNoRows) if not found,
+	// (key, nil) if found, or (nil, otherError) for other DB issues.
+	_, err := db.GetUserPublicKey(msg.Username)
+
+	if err == nil { // User found (GetUserPublicKey returned (key, nil))
+		client.sendAuthResponse(common.MsgTypeRegistrationFailed, msg.Username, nil, "Username already exists.")
+		return
+	} else if err == sql.ErrNoRows { // User not found, proceed with registration
+		// This is the expected case for a new user. Registration can proceed.
+	} else { // Another DB error occurred (err != nil AND err != sql.ErrNoRows)
+		log.Printf("DB error checking user %s: %v", msg.Username, err)
+		client.sendAuthResponse(common.MsgTypeRegistrationFailed, msg.Username, nil, "Server error during registration.")
+		return
+	}
+
+	// If we reach here, err was sql.ErrNoRows, so register the user
+	regErr := db.RegisterUser(msg.Username, msg.Password, msg.ECDHPublicKey)
+	if regErr != nil {
+		log.Printf("Error registering user %s: %v", msg.Username, regErr)
+		client.sendAuthResponse(common.MsgTypeRegistrationFailed, msg.Username, nil, "Failed to register user.")
+		return
+	}
+	client.sendAuthResponse(common.MsgTypeRegistrationSuccess, msg.Username, msg.ECDHPublicKey, "Registration successful. Please login.")
+	log.Printf("User %s registered.", msg.Username)
+}
+
+func (h *Hub) handleUserLogin(client *Client, msg *common.ClientAuthMessage) {
+	user, err := db.AuthenticateUser(msg.Username, msg.Password)
+	if err != nil {
+		log.Printf("Error authenticating user %s: %v", msg.Username, err)
+		client.sendAuthResponse(common.MsgTypeLoginFailed, msg.Username, nil, "Server error during login.")
+		return
+	}
+	if user == nil {
+		client.sendAuthResponse(common.MsgTypeLoginFailed, msg.Username, nil, "Invalid username or password.")
+		return
+	}
+
+	h.mu.Lock()
+	if _, exists := h.userClients[user.Username]; exists {
+		h.mu.Unlock()
+		client.sendAuthResponse(common.MsgTypeLoginFailed, user.Username, nil, "User already logged in elsewhere.")
+		// Optionally disconnect the old client
+		return
+	}
+	client.username = user.Username
+	client.isAuthed = true
+	h.userClients[user.Username] = client
+	h.mu.Unlock()
+
+	onlineUsers := h.getOnlineUsernames()
+	client.sendAuthResponse(common.MsgTypeLoginSuccess, user.Username, user.ECDHPublicKey, "Login successful.", onlineUsers...)
+	log.Printf("User %s logged in.", user.Username)
+	// TODO: Broadcast user online status to other clients
+}
+
+func (h *Hub) handleRequestPubKey(client *Client, targetUsername string) {
+	pubKeyBytes, err := db.GetUserPublicKey(targetUsername)
+	if err != nil || pubKeyBytes == nil {
+		log.Printf("Public key not found for %s (requested by %s): %v", targetUsername, client.username, err)
+		resp := common.PublicKeyResponseMessage{
+			BaseMessage: common.BaseMessage{Type: common.MsgTypePublicKeyResponse, Timestamp: time.Now()},
+			TargetUser:  targetUsername,
+			Found:       false,
+		}
+		respBytes, _ := json.Marshal(resp)
+		client.send <- respBytes
+		return
+	}
+
+	resp := common.PublicKeyResponseMessage{
+		BaseMessage:   common.BaseMessage{Type: common.MsgTypePublicKeyResponse, Timestamp: time.Now()},
+		TargetUser:    targetUsername,
+		ECDHPublicKey: pubKeyBytes,
+		Found:         true,
+	}
+	respBytes, _ := json.Marshal(resp)
+	client.send <- respBytes
+}
+
+func (h *Hub) routeEncryptedDM(edm *common.EncryptedDirectMessage) {
+	h.mu.RLock()
+	recipientClient, ok := h.userClients[edm.Recipient]
+	h.mu.RUnlock()
+
+	if ok {
+		msgBytes, err := json.Marshal(edm)
+		if err != nil {
+			log.Printf("Error marshalling encrypted DM: %v", err)
+			// Potentially send error back to sender
+			return
+		}
+		select {
+		case recipientClient.send <- msgBytes:
+		default:
+			log.Printf("Recipient %s's send channel full.", recipientClient.username)
+			// TODO: Handle offline messaging or error to sender
+		}
+	} else {
+		log.Printf("Recipient %s for DM not found or offline.", edm.Recipient)
+		// TODO: Send 'user offline' message to sender
+		senderClient, sOk := h.userClients[edm.Sender]
+		if sOk {
+			senderClient.sendError("User " + edm.Recipient + " is not online.")
+		}
+	}
+}
+
+// Helper for client to send auth responses
+func (c *Client) sendAuthResponse(msgType, username string, pubKey []byte, message string, onlineUsers ...string) {
+	resp := common.AuthResponseMessage{
+		BaseMessage:   common.BaseMessage{Type: msgType, Timestamp: time.Now()},
+		Username:      username,
+		ECDHPublicKey: pubKey,
+		Message:       message,
+		OnlineUsers:   onlineUsers,
+	}
+	respBytes, _ := json.Marshal(resp)
+	c.send <- respBytes
+}
+
+// Helper for client to send generic errors
+func (c *Client) sendError(errMsg string) {
+	errResp := common.ErrorMessage{
+		BaseMessage: common.BaseMessage{Type: common.MsgTypeError, Timestamp: time.Now()},
+		Content:     errMsg,
+	}
+	errBytes, _ := json.Marshal(errResp)
+	select {
+	case c.send <- errBytes:
+	default:
+		log.Printf("Client %s send channel full when trying to send error.", c.username)
+	}
+}
+
+// readPump and writePump for individual clients (similar to before but simpler)
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
-	// Configure connection limits, timeouts etc.
 	for {
 		_, messageBytes, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("Client %s error: %v", c.username, err)
-			}
+			// Handle close errors
 			break
 		}
-
-		var msg common.Message
-		if err := json.Unmarshal(messageBytes, &msg); err != nil {
-			log.Printf("Error unmarshalling message from %s: %v", c.username, err)
-			// Send error back to client?
-			continue
-		}
-		msg.Timestamp = time.Now()
-
-		// First message should be registration
-		if c.username == "" && msg.Type == common.MsgTypeRegister && msg.Sender != "" {
-			c.username = msg.Sender // Assign username to this client connection
-			c.hub.mu.Lock()
-			// Check if username is already taken (basic check)
-			if _, exists := c.hub.userClients[c.username]; exists {
-				log.Printf("Username %s already taken.", c.username)
-				// TODO: Send error to client and close connection
-				c.username = "" // Reset username
-				c.hub.mu.Unlock()
-				c.conn.WriteJSON(common.Message{Type: common.MsgTypeError, Content: "Username already taken."})
-				return // Close connection
-			}
-			c.hub.userClients[c.username] = c
-			c.hub.mu.Unlock()
-			log.Printf("Client identified as: %s", c.username)
-			// Send confirmation to client
-			c.send <- []byte(`{"type":"` + common.MsgTypeServerInfo + `","content":"Registered successfully."}`)
-			continue
-		} else if c.username == "" {
-			log.Printf("Client tried to send message before registering.")
-			c.conn.WriteJSON(common.Message{Type: common.MsgTypeError, Content: "Please register first."})
-			return // Close connection
-		}
-
-		// Subsequent messages
-		msg.Sender = c.username // Ensure sender is correctly set
-
-		if msg.Type == common.MsgTypeDirectMessage && msg.Recipient != "" {
-			c.hub.directMsg <- &msg
-		} else {
-			// For now, other types could be broadcast or handled differently
-			// c.hub.broadcast <- messageBytes
-			log.Printf("Received unhandled message type %s from %s", msg.Type, c.username)
-		}
+		c.hub.incomingMsg <- clientMessage{client: c, data: messageBytes}
 	}
 }
 
-// writePump pumps messages from the hub to the WebSocket connection.
 func (c *Client) writePump() {
 	defer func() {
 		c.conn.Close()
@@ -182,7 +317,6 @@ func (c *Client) writePump() {
 		select {
 		case message, ok := <-c.send:
 			if !ok {
-				// The hub closed the channel.
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}

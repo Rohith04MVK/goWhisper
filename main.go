@@ -18,15 +18,13 @@ func main() {
 		server.StartServer(*serverAddr)
 	} else {
 		// Client mode
-		args := flag.Args()
-		if len(args) > 0 && args[0] == "connect" {
-			username := client.GetUsername()
-			appClient := client.New(*serverAddr, username)
-			appClient.Run()
-		} else {
-			fmt.Println("Usage: gowhisper connect")
+		if flag.NArg() == 0 || flag.Arg(0) != "connect" { // Expect "connect" command
+			fmt.Println("Usage: gowhisper connect [-addr <ip:port>]")
 			fmt.Println("Or:    gowhisper -server [-addr <ip:port>]")
 			os.Exit(1)
 		}
+		// Username is now handled via /register or /login commands within the client UI
+		appClient := client.New(*serverAddr)
+		appClient.Run()
 	}
 }

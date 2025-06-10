@@ -4,15 +4,15 @@ import (
 	"log"
 	"net/http"
 
+	"gowhisper/internal/db" // Import db package
+
 	"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool { // Allow all origins for simplicity
-		return true
-	},
+	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
 func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
@@ -21,18 +21,20 @@ func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		log.Println("Upgrade error:", err)
 		return
 	}
-
-	client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256), username: ""} // Username set on first message
+	client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256), username: "", isAuthed: false}
 	client.hub.register <- client
 
-	// Allow collection of memory referenced by the caller by doing all work in new goroutines.
 	go client.writePump()
 	go client.readPump()
-
-	log.Println("Client connected")
 }
 
 func StartServer(addr string) {
+	// Initialize Database
+	if err := db.InitDB(); err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	defer db.DB.Close()
+
 	hub := NewHub()
 	go hub.Run()
 
